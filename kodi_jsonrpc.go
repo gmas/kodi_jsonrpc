@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	//"reflect"
 	"sync"
 	"time"
 
@@ -63,12 +64,13 @@ type Response struct {
 }
 
 type rpcResponse struct {
-	Id      *float64                `json:"id"`
-	JsonRPC string                  `json:"jsonrpc"`
-	Method  *string                 `json:"method"`
-	Params  *map[string]interface{} `json:"params"`
-	Result  *map[string]interface{} `json:"result"`
-	Error   *rpcError               `json:"error"`
+	Id      *float64                  `json:"id"`
+	JsonRPC string                    `json:"jsonrpc"`
+	Method  *string                   `json:"method"`
+	Params  *map[string]interface{}   `json:"params"`
+	Results *[]map[string]interface{} //`json:"result"`
+	Result  json.RawMessage           `json: "result"`
+	Error   *rpcError                 `json:"error"`
 }
 
 // Notification stores Kodi server->client notifications.
@@ -134,49 +136,62 @@ func SetLogLevel(level log.Level) {
 // Read returns the result and any errors from the response channel
 // If timeout (seconds) is greater than zero, read will fail if not returned
 // within this time.
-func (rchan *Response) Read(timeout time.Duration) (result map[string]interface{}, err error) {
-	rchan.readLock.Lock()
-	defer close(*rchan.channel)
+func (response *Response) Read(timeout time.Duration) (result []map[string]interface{}, err error) {
+	response.readLock.Lock()
+	defer close(*response.channel)
 	defer func() {
-		rchan.Pending = false
+		response.Pending = false
 	}()
-	defer rchan.readLock.Unlock()
+	defer response.readLock.Unlock()
 
-	if rchan.Pending != true {
+	if response.Pending != true {
 		return result, errors.New(`No pending responses!`)
 	}
-	if rchan.channel == nil {
+	if response.channel == nil {
 		return result, errors.New(`Expected response channel, but got nil!`)
 	}
 
-	res := new(rpcResponse)
+	rpcResp := new(rpcResponse)
+
 	if timeout > 0 {
 		select {
-		case res = <-*rchan.channel:
+		case rpcResp = <-*response.channel:
 		case <-time.After(timeout * time.Second):
 			return result, errors.New(`Timeout waiting on response channel`)
 		}
 	} else {
-		res = <-*rchan.channel
+		rpcResp = <-*response.channel
 	}
-	if res == nil {
+	if rpcResp == nil {
 		return result, errors.New(`Empty result received`)
 	}
-	result, err = res.unpack()
+	result, err = rpcResp.unpack()
 
+	log.WithField(`result`, result).Debug(`Done Reading Response`)
 	return result, err
 }
 
 // Unpack the result and any errors from the Response
-func (res *rpcResponse) unpack() (result map[string]interface{}, err error) {
-	if res.Error != nil {
-		err = fmt.Errorf(`Kodi error (%v): %v`, res.Error.Code, res.Error.Message)
-	} else if res.Result != nil {
-		result = *res.Result
+func (rpcResp *rpcResponse) unpack() (results []map[string]interface{}, err error) {
+	if rpcResp.Error != nil {
+		err = fmt.Errorf(`Kodi error (%v): %v`, rpcResp.Error.Code, rpcResp.Error.Message)
+	} else if rpcResp.Result != nil {
+		log.WithField(`rpcResp.Result`, string(rpcResp.Result)).Debug(`reading JSON rpcResponse.Result`)
+		if err := json.Unmarshal(rpcResp.Result, &results); err != nil {
+			log.WithField(`rpcResp.Result`, rpcResp.Result).Debug(`failed to decode Resutl into slice of maps, attempting decode to map`)
+			var res map[string]interface{}
+			if err := json.Unmarshal(rpcResp.Result, &res); err != nil {
+				log.WithField(`rpcResp.Result`, rpcResp.Result).Info(`failed to decode Result to map`)
+			}
+			results = append(results, res)
+		} else {
+			log.Debug(`Success Decoded into slice`)
+		}
+		log.WithField(`results`, results).Debug(`got results`)
 	} else {
-		log.WithField(`response`, res).Debug(`Received unknown response type from Kodi`)
+		log.WithField(`response`, rpcResp).Debug(`Received unknown response type from Kodi`)
 	}
-	return result, err
+	return results, err
 }
 
 // init brings up an instance of the Kodi Connection
@@ -201,18 +216,21 @@ func (c *Connection) init(address string, timeout time.Duration) (err error) {
 	go c.reader()
 	go c.writer()
 
-	rchan, _ := c.Send(Request{Method: `JSONRPC.Version`}, true)
+	response, _ := c.Send(Request{Method: `JSONRPC.Version`}, true)
 	if err != nil {
 		log.WithField(`error`, err).Error(`Connection closed`)
 		return err
 	}
 
-	res, err := rchan.Read(c.timeout)
+	results, err := response.Read(c.timeout)
 	if err != nil {
 		log.WithField(`error`, err).Error(`Kodi responded`)
 		return err
 	}
-	if version := res[`version`].(map[string]interface{}); version != nil {
+
+	//special case, only one element is returned
+	rpcResp := (results)[0]
+	if version := rpcResp[`version`].(map[string]interface{}); version != nil {
 		if version[`major`].(float64) < KODI_MIN_VERSION {
 			return errors.New(`Kodi version too low, upgrade to Frodo or later`)
 		}
@@ -335,8 +353,12 @@ func (c *Connection) writer() {
 // reader loop processes inbound responses and notifications
 func (c *Connection) reader() {
 	for {
-		res := new(rpcResponse)
-		err := c.dec.Decode(res)
+		// response: {"id":1,"jsonrpc":"2.0","result":[{"playerid":0,"type":"audio"}]}
+		rpcResponse := new(rpcResponse)
+		err := c.dec.Decode(rpcResponse)
+		if err == nil {
+			log.Debug(`JSON Decoded into rpcResponse`)
+		}
 		if _, ok := err.(net.Error); err == io.EOF || ok {
 			log.WithField(`error`, err).Error(`Reading from Kodi`)
 			log.Error(`If this error persists, make sure you are using the JSON-RPC port, not the HTTP port!`)
@@ -347,23 +369,23 @@ func (c *Connection) reader() {
 			log.WithField(`error`, err).Error(`Decoding response from Kodi`)
 			continue
 		}
-		if res.Id == nil && res.Method != nil {
+		if rpcResponse.Id == nil && rpcResponse.Method != nil {
 			c.notificationWait.Add(1)
 			// Process notifications in a separate routine so we don't delay the
 			// processing of standard responses.  This does mean losing ordering
 			// guarantees for notifications.
 			go func() {
-				if res.Params != nil {
+				if rpcResponse.Params != nil {
 					log.WithFields(log.Fields{
-						`notification.Method`: *res.Method,
-						`notification.Params`: *res.Params,
+						`notification.Method`: *rpcResponse.Method,
+						`notification.Params`: *rpcResponse.Params,
 					}).Debug(`Received notification from Kodi`)
 				} else {
-					log.WithField(`notification.Method`, *res.Method).Debug(`Received notification from Kodi`)
+					log.WithField(`notification.Method`, *rpcResponse.Method).Debug(`Received notification from Kodi`)
 				}
 				n := Notification{}
-				n.Method = *res.Method
-				mapstructure.Decode(res.Params, &n.Params)
+				n.Method = *rpcResponse.Method
+				mapstructure.Decode(rpcResponse.Params, &n.Params)
 				// Implement notification writes as a ring buffer.
 				// In case the client is not processing notifications, we don't
 				// want to block indefinitely here, instead drop the oldest
@@ -377,21 +399,21 @@ func (c *Connection) reader() {
 				}
 				c.notificationWait.Done()
 			}()
-		} else if res.Id != nil {
-			if ch := c.responses[uint32(*res.Id)]; ch != nil {
-				if res.Result != nil {
-					log.WithField(`response.Result`, *res.Result).Debug(`Received response from Kodi`)
+		} else if rpcResponse.Id != nil {
+			if ch := c.responses[uint32(*rpcResponse.Id)]; ch != nil {
+				if rpcResponse.Results != nil {
+					log.WithField(`response.Results`, *rpcResponse.Results).Debug(`Received response from Kodi`)
 				}
-				*ch <- res
+				*ch <- rpcResponse
 			} else {
-				log.WithField(`response.Id`, *res.Id).Warn(`Received Kodi response for unknown request`)
+				log.WithField(`response.Id`, *rpcResponse.Id).Warn(`Received Kodi response for unknown request`)
 				log.WithField(`connection.responses`, c.responses).Debug(`Current response channels`)
 			}
 		} else {
-			if res.Error != nil {
-				log.WithField(`response.Error`, *res.Error).Warn(`Received unparseable Kodi response`)
+			if rpcResponse.Error != nil {
+				log.WithField(`response.Error`, *rpcResponse.Error).Warn(`Received unparseable Kodi response`)
 			} else {
-				log.WithField(`response`, res).Warn(`Received unparseable Kodi response`)
+				log.WithField(`response`, rpcResponse).Warn(`Received unparseable Kodi response`)
 			}
 		}
 	}
